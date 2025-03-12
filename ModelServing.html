@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANN Model Serving</title>
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/danfojs@0.3.3/dist/index.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-3.0.0.min.js"></script>
+</head>
+<body>
+    <h1>Heat Sink Performance Prediction Model</h1>
+    
+    <!-- User Input Form -->
+    <label for="N">Number of fins [-]: </label>
+    <input type="number" id="N" value="60"><br><br>
+    <label for="L1">Radial length from the center to the forked point [mm]: </label>
+    <input type="number" id="L1" value="38.5"><br><br>
+    <label for="deltaT">Temperature difference between heat sink and surrounding air [K]: </label>
+    <input type="number" id="deltaT" value="30"><br><br>
+    
+    <button id="predictionButton">Predict</button>
+	
+    <h3>Prediction Results</h3>
+    <p id="prediction">Thermal Resistance: </p>
+    
+    <div id="plotly-chart" style="width:100%; height:600px;"></div>
+    
+    <script>
+		let model;
+		let M_calc, OutputPoint_den, min_y_values, min_x_values, bad_y_values, bad_x_values, FindingXAcrdngMinY;
+		let y_train_min, y_train_max;
+	
+        async function loadModel() {
+			try {
+				model = await tf.loadLayersModel('./model.json');
+			} catch (error) {
+				console.error("Error loading the model:", error);
+				alert("Failed to load the model. Please try again later.");
+			}
+        }
+
+        async function predict() {
+            if (!model) {
+                alert("Model is not loaded yet.");
+                return;
+            }
+			
+			let N = parseFloat(document.getElementById('N').value);
+            let L_1 = parseFloat(document.getElementById('L1').value);
+            let delta_T = parseFloat(document.getElementById('deltaT').value);
+			
+			const csvFile1Url = './Train_101.csv'
+			const csvFile2Url = './HS_TotalFinMass.csv'
+			
+			Papa.parse(csvFile1Url, {
+				download: true,
+				complete: function(results) {
+					const xy_train = results.data;
+					const x_train_ori = xy_train.map(row => row.slice(0, 3));
+					const y_train_ori = xy_train.map(row => [row[row.length - 1]]);
+					
+					console.log("x_train_ori:", x_train_ori);
+					console.log("y_train_ori:", y_train_ori);
+					loadSecondFile(x_train_ori, y_train_ori);
+				}
+			});
+
+			function loadSecondFile(x_train_ori, y_train_ori) {
+                Papa.parse(csvFile2Url, {
+                    download: true,
+                    complete: function(results) {
+                        const RefNLM = results.data;
+                        processFiles(RefNLM, x_train_ori, y_train_ori);
+                    }
+                });
+            }
+			
+			function processFiles(RefNLM, x_train_ori, y_train_ori) {
+				const RefNLM_data = RefNLM.map(row => row.map(Number));
+				let InputArray = RefNLM_data.map(row => [...row.slice(0, 2), delta_T]);
+				const MassArray = RefNLM_data.map(row => [row[row.length - 1]]);
+				
+				const x_train_min = Math.min(...x_train_ori.map(row => Math.min(...row)));
+				const x_train_max = Math.max(...x_train_ori.map(row => Math.max(...row)));			
+				
+				let InputArray_norm = InputArray.map(row => row.map(value => (value - x_train_min) / (x_train_max - x_train_min)));
+		
+				let tfInputArray = tf.tensor(InputArray_norm);
+				let OutputArray = model.predict(tfInputArray).arraySync();
+				
+				y_train_min = Math.min(...y_train_ori.map(row => row[0]));
+				y_train_max = Math.max(...y_train_ori.map(row => row[0]));
+				
+				OutputArray_den = OutputArray.map(value => value * (y_train_max - y_train_min) + y_train_min);
+
+				let MRArray = MassArray.map((mass, index) => [...mass, OutputArray_den[index]]);
+			
+				let df_MR = new dfd.DataFrame(MRArray, { columns: ['Total fin mass [kg]', '$R_{th}$ [K/W]'] });
+				let x = df_MR['Total fin mass [kg]'];
+				let y = df_MR['$R_{th}$ [K/W]'];
+			
+				const num_bins = 33;
+				let x_min = Math.min(...x);
+				let x_max = Math.max(...x);
+
+				let bins = Array.from({ length: num_bins + 1 }, (_, i) => x_min + (x_max - x_min) * (i / num_bins));
+				
+				min_y_values = [];
+				min_x_values = [];
+				
+				for (let i = 0; i < bins.length - 1; i++) {
+					let mask = x.map(val => val >= bins[i] && val < bins[i + 1]);
+					let filtered_y = mask.map((value, idx) => value ? y[idx] : null).filter(val => val !== null);
+					let filtered_x = mask.map((value, idx) => value ? x[idx] : null).filter(val => val !== null);
+		  
+					if (filtered_y.length > 0) {
+						let min_y = Math.min(...filtered_y);
+						let min_x = filtered_x[filtered_y.indexOf(min_y)];
+						min_y_values.push(min_y);
+						min_x_values.push(min_x);
+					}
+				}
+				
+				min_y_values = [Math.min(...y)] + min_y_values;
+				min_x_values = [Math.min(...x)] + min_x_values;
+				
+				let FindingMinYIndex = y.indexOf(Math.min(...y));
+				FindingXAcrdngMinY = x[FindingMinYIndex];
+				
+				for (let j = 1; j < min_y_values.length; j++) {
+					if (min_y_values[j] > min_y_values[j - 1] && min_x_values[j] > FindingXAcrdngMinY) {
+						bad_y_values = [...min_y_values.slice(j - 1), Math.max(...y)];
+						bad_x_values = [...min_x_values.slice(j - 1), Math.max(...x)];
+			
+						min_y_values = min_y_values.slice(0, j);
+						min_x_values = min_x_values.slice(0, j);
+						break;
+					}
+				}
+			
+				function calculate_V_fin_total(N, L_1) {
+					const term1 = 3e-5;
+					const term2 = 32e-3;
+					const term3 = 11e-2;
+					const term4 = 7.2e-7;
+					let theta = (360 / N) * (Math.PI / 180);
+				
+					let first_part = (L_1 * 1e-3 - term2);
+					let second_part = ((Math.PI - theta) * L_1 * 1e-3 * Math.sin(theta / 2)) / (1 - Math.sin(theta / 2));
+					let third_part = term3 - (2 * L_1 * 1e-3 * Math.cos(theta / 2)) / (1 - Math.sin(theta / 2));
+					const fourth_part = term4;
+
+					let V_fin_total = (term1 * (first_part + second_part + third_part) + fourth_part) * (N / 3);
+					return V_fin_total;
+				}
+			
+				let V_calc = calculate_V_fin_total(N, L_1);
+				M_calc = 2700 * V_calc;
+				
+				let InputPoint = [N, L_1, delta_T];
+				let InputPoint_norm = InputPoint.map(val => (val - x_train_min) / (x_train_max - x_train_min));
+				
+				let InputTensor = tf.tensor([InputPoint_norm]);
+				let OutputTensor = model.predict(InputTensor);
+				let OutputPoint = OutputTensor.dataSync();
+
+				let OutputPoint_den = OutputPoint[0] * (y_train_max - y_train_min) + y_train_min;
+				
+				let RoundedOutput = OutputPoint_den.toFixed(2);
+				document.getElementById('prediction').innerText = `Predicted thermal resistance: ${RoundedOutput} [K/W]`;
+				
+				plotGraph();
+			}
+			
+			function plotGraph() {
+				let trace1 = {
+					x: [M_calc],
+					y: [OutputPoint_den],
+					mode: 'markers',
+					type: 'scatter',
+					marker: { color: 'lime', size: 7.5, line: { color: 'black', width: 1 } }
+				};
+
+				let trace2 = {
+					x: min_x_values,
+					y: min_y_values,
+					mode: 'lines',
+					type: 'scatter',
+					line: { color: 'red', width: 1.25 }
+				};
+
+				let trace3 = {
+					x: bad_x_values,
+					y: bad_y_values,
+					mode: 'lines',
+					type: 'scatter',
+					line: { color: 'orange', dash: 'dot', width: 1 }
+				};
+
+				let trace4 = {
+					x: min_x_values.concat(min_x_values.slice().reverse()),
+					y: min_y_values.concat(new Array(min_y_values.length).fill(y_train_min)),
+					fill: 'toself',
+					fillcolor: 'rgba(169,169,169,0.3)',
+					line: { color: 'gray' },
+					type: 'scatter',
+					mode: 'none'
+				};
+
+				let trace5 = {
+					x: bad_x_values.concat(bad_x_values.slice().reverse()),  
+					y: bad_y_values.concat(new Array(bad_y_values.length).fill(y_train_max)),
+					fill: 'toself',
+					fillcolor: 'rgba(169,169,169,0.3)',
+					line: { color: 'gray' },
+					type: 'scatter',
+					mode: 'none'
+				};
+
+				let trace6 = {
+					x: bad_x_values.concat(bad_x_values.slice().reverse()),
+					y: bad_y_values.concat(new Array(bad_y_values.length).fill(y_train_max)),
+					fill: 'toself',
+					fillcolor: 'rgba(72,61,139,0.2)',
+					line: { color: 'darkslateblue' },
+					type: 'scatter',
+					mode: 'none'
+				};
+
+				let layout = {
+					xaxis: {
+						title: 'Total fin mass [kg]',
+						range: [Math.min(...x), Math.max(...x)],
+						tickmode: 'array',
+						tickvals: [0.05, 0.07, 0.09, 0.11, 0.13],
+						ticktext: ['0.05', '0.07', '0.09', '0.11', '0.13']
+					},
+					yaxis: {
+						title: '$R_{th}$ [K/W]',
+						range: [1.7, Math.max(...y) + 0.1]
+					},
+					showlegend: false,
+					plot_bgcolor: 'white',
+					paper_bgcolor: 'white'
+				};
+
+				Plotly.newPlot('plotly-chart', [trace1, trace2, trace3, trace4, trace5, trace6], layout);
+				
+				let annotations = [
+					{
+						x: 0.06,
+						y: 1.825,
+						text: 'Unattainable domain',
+						showarrow: true,
+						arrowhead: 7,
+						ax: 0,
+						ay: -40,
+						font: { size: 12.5, color: 'black' }
+					},
+					{
+						x: (FindingXAcrdngMinY + Math.max(...x)) / 2,
+						y: Math.max(...y) - 0.2,
+						text: 'Not recommended domain',
+						showarrow: true,
+						arrowhead: 7,
+						ax: 0,
+						ay: 40,
+						font: { size: 12.5, color: 'black' }
+					},
+					{
+						x: (min_x_values[0] + min_x_values[min_x_values.length - 1]) / 2,
+						y: (min_y_values[0] + min_y_values[min_y_values.length - 1]) / 2,
+						text: 'Feasible domain',
+						showarrow: true,
+						arrowhead: 7,
+						ax: 0,
+						ay: 40,
+						font: { size: 12.5, color: 'black' }
+					},
+					{
+						x: M_calc + 0.0035,
+						y: OutputPoint_den + 0.1,
+						text: 'Your case',
+						font: { size: 12.5, color: 'green' }
+					},
+					{
+						x: min_x_values[0],
+						y: min_y_values[0],
+						text: 'Optimal line',
+						showarrow: true,
+						arrowhead: 7,
+						ax: 0,
+						ay: -30,
+						font: { size: 12.5, color: 'red' }
+					}
+				];
+			
+				Plotly.relayout('plotly-chart', { annotations: annotations });
+			}
+		}		
+		
+		window.onload = function() {
+            loadModel();
+		};
+		
+		document.getElementById("predictionButton").addEventListener("click", predict);
+    </script>
+</body>
+</html>
